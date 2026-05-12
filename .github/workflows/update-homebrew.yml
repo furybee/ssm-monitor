@@ -1,0 +1,67 @@
+name: Update Homebrew formula
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to publish (e.g. v0.2.0)"
+        required: true
+        type: string
+
+jobs:
+  update-formula:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: version
+        run: |
+          tag="${{ inputs.version || github.event.release.tag_name }}"
+          if [ -z "$tag" ]; then
+            echo "::error::No version provided"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download source tarball and compute SHA256
+        id: hash
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${tag}.tar.gz"
+          curl -sL --fail -o release.tar.gz "$url"
+          sha=$(sha256sum release.tar.gz | awk '{print $1}')
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: furybee/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        env:
+          NEW_URL: ${{ steps.hash.outputs.url }}
+          NEW_SHA: ${{ steps.hash.outputs.sha }}
+        run: |
+          file="tap/Formula/ssm-monitor.rb"
+          # '#' as sed delimiter so we don't clash with the URL's slashes
+          sed -i -E "s#^(\s*url )\".*\"#\\1\"${NEW_URL}\"#" "$file"
+          sed -i -E "s#^(\s*sha256 )\".*\"#\\1\"${NEW_SHA}\"#" "$file"
+          echo "Updated formula:"
+          cat "$file"
+
+      - name: Commit and push to tap
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/ssm-monitor.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date — nothing to commit."
+            exit 0
+          fi
+          git commit -m "Update ssm-monitor to ${{ steps.version.outputs.tag }}"
+          git push
