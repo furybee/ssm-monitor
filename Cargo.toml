@@ -1,0 +1,19 @@
+[package]
+name = "ssm-monitor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "TUI monitor for AWS SSM-managed instances with bookmarks, alarms, and SSM session launcher"
+repository = "https://github.com/furybee/ssm-monitor"
+readme = "README.md"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-ssm = "1"
+aws-sdk-ec2 = "1"
+aws-sdk-cloudwatch = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
