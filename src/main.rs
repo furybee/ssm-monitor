@@ -20,7 +20,8 @@ use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -111,6 +112,20 @@ struct AlarmInfo {
     reason: Option<String>,
 }
 
+#[derive(Clone)]
+struct Container {
+    name: String,
+    image: String,
+    status: String,
+}
+
+#[derive(Clone)]
+enum ContainerState {
+    Loading,
+    Loaded(Vec<Container>),
+    Failed(String),
+}
+
 struct Instance {
     id: String,
     name: String,
@@ -180,6 +195,21 @@ impl View {
     }
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum DetailTab {
+    Details,
+    Containers,
+}
+
+impl DetailTab {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Details => Self::Containers,
+            Self::Containers => Self::Details,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Sort {
     Default,
@@ -238,11 +268,16 @@ enum DataUpdate {
     Loaded(Vec<Instance>),
     Failed(String),
     ProfileSwitched { profile: String, region: String },
+    Containers {
+        instance_id: String,
+        result: Result<Vec<Container>, String>,
+    },
 }
 
 enum AppCommand {
     Refresh,
     SwitchProfile { profile: String, region: String },
+    LoadContainers { instance_id: String },
 }
 
 struct App {
@@ -267,6 +302,9 @@ struct App {
     pending_profile: Option<String>,
     region_picker_idx: usize,
     region_picker_text: String,
+    container_states: HashMap<String, ContainerState>,
+    container_list_state: ListState,
+    detail_tab: DetailTab,
 }
 
 impl App {
@@ -304,6 +342,9 @@ impl App {
             pending_profile: None,
             region_picker_idx: 0,
             region_picker_text: String::new(),
+            container_states: HashMap::new(),
+            container_list_state: ListState::default(),
+            detail_tab: DetailTab::Details,
         };
         app.reset_selection();
         app
@@ -868,6 +909,89 @@ async fn fetch_alarms(client: &CwClient) -> Result<HashMap<String, Vec<AlarmInfo
     Ok(map)
 }
 
+fn parse_docker_ps(output: &str) -> Vec<Container> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(3, '|').collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            Some(Container {
+                name: parts[0].trim().to_string(),
+                image: parts[1].trim().to_string(),
+                status: parts[2].trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+async fn fetch_containers(ssm: &SsmClient, instance_id: &str) -> Result<Vec<Container>> {
+    let send_resp = ssm
+        .send_command()
+        .document_name("AWS-RunShellScript")
+        .instance_ids(instance_id)
+        .parameters(
+            "commands",
+            vec!["docker ps --format '{{.Names}}|{{.Image}}|{{.Status}}' 2>&1".to_string()],
+        )
+        .send()
+        .await?;
+
+    let command_id = send_resp
+        .command()
+        .and_then(|c| c.command_id())
+        .ok_or_else(|| anyhow::anyhow!("SSM did not return a command id"))?
+        .to_string();
+
+    // Poll for completion. send-command itself is async; results land in ~1-3s for `docker ps`.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let inv = match ssm
+            .get_command_invocation()
+            .command_id(&command_id)
+            .instance_id(instance_id)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue, // Sometimes get_command_invocation 404s right after send-command
+        };
+
+        let status = inv
+            .status()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default();
+        match status.as_str() {
+            "Success" => {
+                let output = inv.standard_output_content().unwrap_or("");
+                return Ok(parse_docker_ps(output));
+            }
+            "Failed" | "Cancelled" | "TimedOut" => {
+                let err = inv.standard_error_content().unwrap_or("").trim().to_string();
+                let out = inv.standard_output_content().unwrap_or("").trim();
+                let body = if err.is_empty() { out } else { err.as_str() };
+                if body.contains("command not found") || body.contains("docker: not found") {
+                    return Err(anyhow::anyhow!("docker is not installed on this instance"));
+                }
+                if body.contains("Cannot connect to the Docker daemon") {
+                    return Err(anyhow::anyhow!("docker daemon not running"));
+                }
+                return Err(anyhow::anyhow!(
+                    "{}",
+                    if body.is_empty() {
+                        "command failed".to_string()
+                    } else {
+                        body.to_string()
+                    }
+                ));
+            }
+            _ => continue, // Pending, InProgress, Delayed
+        }
+    }
+    Err(anyhow::anyhow!("command timed out after 30s"))
+}
+
 async fn fetch_instances(
     ssm: &SsmClient,
     ec2: &Ec2Client,
@@ -921,24 +1045,29 @@ fn spawn_coordinator(
         let mut ec2 = initial_ec2;
         let mut cw = initial_cw;
         loop {
+            let mut should_refresh = false;
             tokio::select! {
-                _ = tokio::time::sleep(REFRESH_INTERVAL) => {}
+                _ = tokio::time::sleep(REFRESH_INTERVAL) => {
+                    should_refresh = true;
+                }
                 cmd = cmd_rx.recv() => {
                     let Some(cmd) = cmd else { break };
-                    apply_command(cmd, &mut ssm, &mut ec2, &mut cw, &data_tx).await;
+                    should_refresh |= apply_command(cmd, &mut ssm, &mut ec2, &mut cw, &data_tx).await;
                 }
             }
-            // Drain any extra commands that piled up while waking.
             while let Ok(cmd) = cmd_rx.try_recv() {
-                apply_command(cmd, &mut ssm, &mut ec2, &mut cw, &data_tx).await;
+                should_refresh |=
+                    apply_command(cmd, &mut ssm, &mut ec2, &mut cw, &data_tx).await;
             }
 
-            let update = match fetch_instances(&ssm, &ec2, &cw).await {
-                Ok(list) => DataUpdate::Loaded(list),
-                Err(e) => DataUpdate::Failed(format!("{e:#}")),
-            };
-            if data_tx.send(update).is_err() {
-                break;
+            if should_refresh {
+                let update = match fetch_instances(&ssm, &ec2, &cw).await {
+                    Ok(list) => DataUpdate::Loaded(list),
+                    Err(e) => DataUpdate::Failed(format!("{e:#}")),
+                };
+                if data_tx.send(update).is_err() {
+                    break;
+                }
             }
         }
     });
@@ -950,9 +1079,9 @@ async fn apply_command(
     ec2: &mut Ec2Client,
     cw: &mut CwClient,
     data_tx: &UnboundedSender<DataUpdate>,
-) {
+) -> bool {
     match cmd {
-        AppCommand::Refresh => {}
+        AppCommand::Refresh => true,
         AppCommand::SwitchProfile { profile, region } => {
             let (new_ssm, new_ec2, new_cw, resolved_region) =
                 build_clients_for_profile(&profile, &region).await;
@@ -963,6 +1092,22 @@ async fn apply_command(
                 profile,
                 region: resolved_region,
             });
+            true
+        }
+        AppCommand::LoadContainers { instance_id } => {
+            // Run in its own task so it doesn't block the coordinator (poll loop ~2-3s).
+            let ssm_clone = ssm.clone();
+            let data_tx_clone = data_tx.clone();
+            tokio::spawn(async move {
+                let result = fetch_containers(&ssm_clone, &instance_id)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                let _ = data_tx_clone.send(DataUpdate::Containers {
+                    instance_id,
+                    result,
+                });
+            });
+            false
         }
     }
 }
@@ -1011,16 +1156,27 @@ fn run_ssm_session<B: Backend>(
     terminal: &mut Terminal<B>,
     instance_id: &str,
     profile: &str,
+    region: &str,
+    docker_exec_container: Option<&str>,
 ) -> io::Result<Option<String>> {
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    let msg = match Command::new("aws")
-        .env("AWS_PROFILE", profile)
-        .args(["ssm", "start-session", "--target", instance_id])
-        .status()
-    {
+    let mut cmd = Command::new("aws");
+    cmd.env("AWS_PROFILE", profile);
+    cmd.env("AWS_REGION", region);
+    cmd.arg("ssm")
+        .arg("start-session")
+        .arg("--target")
+        .arg(instance_id);
+    if let Some(container) = docker_exec_container {
+        cmd.arg("--document-name").arg("AWS-StartInteractiveCommand");
+        cmd.arg("--parameters")
+            .arg(format!("command=docker exec -it {container} sh"));
+    }
+
+    let msg = match cmd.status() {
         Ok(status) if status.success() => None,
         Ok(status) => {
             eprintln!("\nSSM session exited with status {status}. Press Enter to return.");
@@ -1053,6 +1209,81 @@ fn request_refresh(app: &mut App, cmd_tx: &UnboundedSender<AppCommand>) {
     let _ = cmd_tx.send(AppCommand::Refresh);
 }
 
+fn ensure_containers_loaded(app: &mut App, cmd_tx: &UnboundedSender<AppCommand>) {
+    let Some(id) = app.selected_id() else {
+        return;
+    };
+    let already = matches!(
+        app.container_states.get(&id),
+        Some(ContainerState::Loading) | Some(ContainerState::Loaded(_))
+    );
+    if already {
+        return;
+    }
+    app.container_states
+        .insert(id.clone(), ContainerState::Loading);
+    let _ = cmd_tx.send(AppCommand::LoadContainers { instance_id: id });
+}
+
+fn refresh_containers(app: &mut App, cmd_tx: &UnboundedSender<AppCommand>) {
+    let Some(id) = app.selected_id() else {
+        return;
+    };
+    app.container_states
+        .insert(id.clone(), ContainerState::Loading);
+    let _ = cmd_tx.send(AppCommand::LoadContainers { instance_id: id });
+}
+
+fn current_containers<'a>(app: &'a App) -> Option<&'a [Container]> {
+    let id = app.selected_id()?;
+    match app.container_states.get(&id)? {
+        ContainerState::Loaded(list) => Some(list.as_slice()),
+        _ => None,
+    }
+}
+
+fn selected_container_name(app: &App) -> Option<String> {
+    let list = current_containers(app)?;
+    let idx = app.container_list_state.selected()?;
+    list.get(idx).map(|c| c.name.clone())
+}
+
+fn container_picker_next(app: &mut App) {
+    let len = current_containers(app).map(|l| l.len()).unwrap_or(0);
+    if len == 0 {
+        app.container_list_state.select(None);
+        return;
+    }
+    let cur = app.container_list_state.selected().unwrap_or(0);
+    let next = (cur + 1) % len;
+    app.container_list_state.select(Some(next));
+}
+
+fn container_picker_previous(app: &mut App) {
+    let len = current_containers(app).map(|l| l.len()).unwrap_or(0);
+    if len == 0 {
+        app.container_list_state.select(None);
+        return;
+    }
+    let cur = app.container_list_state.selected().unwrap_or(0);
+    let prev = if cur == 0 { len - 1 } else { cur - 1 };
+    app.container_list_state.select(Some(prev));
+}
+
+fn clamp_container_picker(app: &mut App) {
+    let len = current_containers(app).map(|l| l.len()).unwrap_or(0);
+    if len == 0 {
+        app.container_list_state.select(None);
+    } else {
+        let cur = app.container_list_state.selected().unwrap_or(0);
+        if cur >= len {
+            app.container_list_state.select(Some(0));
+        } else if app.container_list_state.selected().is_none() {
+            app.container_list_state.select(Some(0));
+        }
+    }
+}
+
 fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -1076,6 +1307,18 @@ fn run_app<B: Backend>(
                     app.profile = profile;
                     app.region = region;
                     app.last_error = None;
+                    app.container_states.clear();
+                }
+                DataUpdate::Containers {
+                    instance_id,
+                    result,
+                } => {
+                    let state = match result {
+                        Ok(list) => ContainerState::Loaded(list),
+                        Err(e) => ContainerState::Failed(e),
+                    };
+                    app.container_states.insert(instance_id, state);
+                    clamp_container_picker(app);
                 }
             }
         }
@@ -1116,6 +1359,9 @@ fn run_app<B: Backend>(
                 KeyCode::Enter => {
                     if app.selected_id().is_some() {
                         app.mode = Mode::Detail;
+                        app.detail_tab = DetailTab::Details;
+                        app.container_list_state.select(Some(0));
+                        ensure_containers_loaded(app, &cmd_tx);
                     }
                 }
                 _ => {}
@@ -1137,17 +1383,44 @@ fn run_app<B: Backend>(
                     app.mode = Mode::Normal;
                     app.last_message = None;
                 }
-                KeyCode::Down | KeyCode::Char('j') => app.next(),
-                KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                KeyCode::Char('c') => {
-                    if let Some(id) = app.selected_id() {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                    app.detail_tab = app.detail_tab.toggle();
+                }
+                KeyCode::Down | KeyCode::Char('j') if app.detail_tab == DetailTab::Containers => {
+                    container_picker_next(app);
+                }
+                KeyCode::Up | KeyCode::Char('k') if app.detail_tab == DetailTab::Containers => {
+                    container_picker_previous(app);
+                }
+                KeyCode::Enter if app.detail_tab == DetailTab::Containers => {
+                    if let (Some(id), Some(container)) =
+                        (app.selected_id(), selected_container_name(app))
+                    {
                         let profile = app.profile.clone();
-                        match run_ssm_session(terminal, &id, &profile) {
+                        let region = app.region.clone();
+                        match run_ssm_session(
+                            terminal,
+                            &id,
+                            &profile,
+                            &region,
+                            Some(&container),
+                        ) {
                             Ok(msg) => app.last_message = msg,
                             Err(e) => app.last_message = Some(format!("Error: {e}")),
                         }
                     }
                 }
+                KeyCode::Char('c') => {
+                    if let Some(id) = app.selected_id() {
+                        let profile = app.profile.clone();
+                        let region = app.region.clone();
+                        match run_ssm_session(terminal, &id, &profile, &region, None) {
+                            Ok(msg) => app.last_message = msg,
+                            Err(e) => app.last_message = Some(format!("Error: {e}")),
+                        }
+                    }
+                }
+                KeyCode::Char('D') => refresh_containers(app, &cmd_tx),
                 KeyCode::Char('b') => app.toggle_favorite(),
                 KeyCode::Char('r') => request_refresh(app, &cmd_tx),
                 KeyCode::Char('?') => app.mode = Mode::Help,
@@ -1560,13 +1833,13 @@ fn ui_detail(f: &mut Frame, app: &mut App) {
         app.mode = Mode::Normal;
         return;
     };
-    let Some(inst) = app.instance_by_id(&id) else {
+    let Some(inst_clone) = app.instance_by_id(&id).map(snapshot_instance) else {
         app.mode = Mode::Normal;
         return;
     };
-    let is_fav = app.favorites.contains(&inst.id);
 
     let chunks = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(3),
@@ -1575,7 +1848,98 @@ fn ui_detail(f: &mut Frame, app: &mut App) {
 
     f.render_widget(Paragraph::new(top_status_line(app)), chunks[0]);
 
-    let last_ping_str = inst.last_ping_str();
+    let container_count = match app.container_states.get(&id) {
+        Some(ContainerState::Loaded(l)) => Some(l.len()),
+        _ => None,
+    };
+    let containers_tab_title = match container_count {
+        Some(n) => format!(" Containers ({n}) "),
+        None => " Containers ".to_string(),
+    };
+    let tab_titles = vec![" Details ".to_string(), containers_tab_title];
+    let selected_tab = match app.detail_tab {
+        DetailTab::Details => 0,
+        DetailTab::Containers => 1,
+    };
+    let tabs = Tabs::new(tab_titles)
+        .select(selected_tab)
+        .divider("")
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_widget(tabs, chunks[1]);
+
+    let title = format!(" Instance Details — {} ({}) ", inst_clone.id, inst_clone.name);
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    match app.detail_tab {
+        DetailTab::Details => ui_detail_tab(f, app, &inst_clone, chunks[2], block),
+        DetailTab::Containers => ui_containers_tab(f, app, &inst_clone, chunks[2], block),
+    }
+
+    let actions_text = match app.detail_tab {
+        DetailTab::Details => {
+            " ←/→ tabs · c SSM shell · b bookmark · r refresh · D reload containers · ? help · Esc back"
+        }
+        DetailTab::Containers => {
+            " ↑/↓ pick container · Enter exec · ←/→ tabs · c SSM shell · D reload · ? help · Esc back"
+        }
+    };
+    let actions =
+        Paragraph::new(actions_text).block(Block::default().borders(Borders::ALL).title("Actions"));
+    f.render_widget(actions, chunks[3]);
+}
+
+fn snapshot_instance(i: &Instance) -> RenderedInstance {
+    RenderedInstance {
+        id: i.id.clone(),
+        name: i.name.clone(),
+        status: i.status.clone(),
+        platform: i.platform.clone(),
+        platform_version: i.platform_version.clone(),
+        ip_address: i.ip_address.clone(),
+        agent_version: i.agent_version.clone(),
+        last_ping_str: i.last_ping_str(),
+        is_stale: i.is_stale(),
+        alarms: i.alarms.clone(),
+    }
+}
+
+struct RenderedInstance {
+    id: String,
+    name: String,
+    status: String,
+    platform: String,
+    platform_version: String,
+    ip_address: String,
+    agent_version: String,
+    last_ping_str: String,
+    is_stale: bool,
+    alarms: Vec<AlarmInfo>,
+}
+
+fn ui_detail_tab(f: &mut Frame, app: &App, inst: &RenderedInstance, area: Rect, block: Block) {
+    let is_fav = app.favorites.contains(&inst.id);
+    let status_style = if inst.is_stale {
+        Style::default().fg(Color::Yellow)
+    } else {
+        match inst.status.as_str() {
+            "Online" => Style::default().fg(Color::Green),
+            "ConnectionLost" => Style::default().fg(Color::Red),
+            "Inactive" => Style::default().fg(Color::DarkGray),
+            _ => Style::default().fg(Color::Yellow),
+        }
+    };
+    let status_label = if inst.is_stale {
+        format!("{} (stale)", inst.status)
+    } else {
+        inst.status.clone()
+    };
+
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
     lines.push(detail_field("ID:", &inst.id));
@@ -1586,13 +1950,13 @@ fn ui_detail(f: &mut Frame, app: &mut App) {
             format!("{:<20}", "Status:"),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(status_label_for(inst), status_style_for(inst)),
+        Span::styled(status_label, status_style),
     ]));
     lines.push(detail_field("Platform:", &inst.platform));
     lines.push(detail_field("Platform Version:", &inst.platform_version));
     lines.push(detail_field("IP Address:", &inst.ip_address));
     lines.push(detail_field("Agent Version:", &inst.agent_version));
-    lines.push(detail_field("Last Ping:", &last_ping_str));
+    lines.push(detail_field("Last Ping:", &inst.last_ping_str));
     lines.push(detail_field(
         "Favorite:",
         if is_fav { "★ yes" } else { "no" },
@@ -1642,17 +2006,105 @@ fn ui_detail(f: &mut Frame, app: &mut App) {
         ]));
     }
 
-    let title = format!(" Instance Details — {} ({}) ", inst.id, inst.name);
     let body = Paragraph::new(Text::from(lines))
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(block)
         .wrap(Wrap { trim: false });
-    f.render_widget(body, chunks[1]);
+    f.render_widget(body, area);
+}
 
-    let actions = Paragraph::new(
-        " c: SSM session · b: toggle bookmark · ↑/↓: prev/next · r: refresh · ? help · Esc/q: back",
-    )
-    .block(Block::default().borders(Borders::ALL).title("Actions"));
-    f.render_widget(actions, chunks[2]);
+fn ui_containers_tab(
+    f: &mut Frame,
+    app: &mut App,
+    inst: &RenderedInstance,
+    area: Rect,
+    block: Block,
+) {
+    match app.container_states.get(&inst.id) {
+        None => {
+            let p = Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  (not yet loaded — press D to load)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]))
+            .block(block);
+            f.render_widget(p, area);
+        }
+        Some(ContainerState::Loading) => {
+            let p = Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  loading via SSM send-command...",
+                    Style::default().fg(Color::Cyan),
+                )),
+            ]))
+            .block(block);
+            f.render_widget(p, area);
+        }
+        Some(ContainerState::Failed(err)) => {
+            let err = err.clone();
+            let p = Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("⚠ {err}"), Style::default().fg(Color::Red)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  (press D to retry)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]))
+            .block(block)
+            .wrap(Wrap { trim: false });
+            f.render_widget(p, area);
+        }
+        Some(ContainerState::Loaded(list)) => {
+            if list.is_empty() {
+                let p = Paragraph::new(Text::from(vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  (no running containers)",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ]))
+                .block(block);
+                f.render_widget(p, area);
+            } else {
+                let items: Vec<ListItem> = list
+                    .iter()
+                    .map(|c| {
+                        let status_color = if c.status.starts_with("Up") {
+                            Color::Green
+                        } else {
+                            Color::Yellow
+                        };
+                        let line = Line::from(vec![
+                            Span::styled(
+                                format!(" {:<24}", c.name),
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(" "),
+                            Span::raw(format!("{:<32}", c.image)),
+                            Span::raw(" "),
+                            Span::styled(c.status.clone(), Style::default().fg(status_color)),
+                        ]);
+                        ListItem::new(line)
+                    })
+                    .collect();
+
+                let list_widget = List::new(items).block(block).highlight_style(
+                    Style::default()
+                        .bg(Color::Blue)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ).highlight_symbol("▶ ");
+
+                f.render_stateful_widget(list_widget, area, &mut app.container_list_state);
+            }
+        }
+    }
 }
 
 fn help_line(key: &str, desc: &str) -> Line<'static> {
@@ -1697,7 +2149,11 @@ fn ui_help(f: &mut Frame) {
         help_line("r", "refresh data immediately (auto every 30s)"),
         help_line("p", "switch AWS profile (then region) — both pickers are filterable"),
         help_line("R", "switch region only (keep current profile)"),
-        help_line("c", "(in detail view) start an SSM session on the selected instance"),
+        help_line("c", "(detail) start a plain SSM shell session on the instance"),
+        help_line("←/→", "(detail) switch between Details and Containers tabs"),
+        help_line("↑/↓", "(detail · Containers tab) pick a container"),
+        help_line("Enter", "(detail · Containers tab) docker exec -it sh into the selected container"),
+        help_line("D", "(detail) reload the docker ps list"),
         Line::from(""),
         help_section("Notes"),
         Line::from("    · Favorites are stored at ~/.config/ssm-monitor/favorites"),
