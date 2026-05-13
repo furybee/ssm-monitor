@@ -28,6 +28,40 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const STALE_THRESHOLD_SECS: i64 = 300;
 
+const AWS_REGIONS: &[(&str, &str)] = &[
+    ("us-east-1", "N. Virginia"),
+    ("us-east-2", "Ohio"),
+    ("us-west-1", "N. California"),
+    ("us-west-2", "Oregon"),
+    ("af-south-1", "Cape Town"),
+    ("ap-east-1", "Hong Kong"),
+    ("ap-south-1", "Mumbai"),
+    ("ap-south-2", "Hyderabad"),
+    ("ap-northeast-1", "Tokyo"),
+    ("ap-northeast-2", "Seoul"),
+    ("ap-northeast-3", "Osaka"),
+    ("ap-southeast-1", "Singapore"),
+    ("ap-southeast-2", "Sydney"),
+    ("ap-southeast-3", "Jakarta"),
+    ("ap-southeast-4", "Melbourne"),
+    ("ca-central-1", "Canada Central"),
+    ("ca-west-1", "Calgary"),
+    ("eu-central-1", "Frankfurt"),
+    ("eu-central-2", "Zurich"),
+    ("eu-west-1", "Ireland"),
+    ("eu-west-2", "London"),
+    ("eu-west-3", "Paris"),
+    ("eu-north-1", "Stockholm"),
+    ("eu-south-1", "Milan"),
+    ("eu-south-2", "Spain"),
+    ("me-south-1", "Bahrain"),
+    ("me-central-1", "UAE"),
+    ("il-central-1", "Tel Aviv"),
+    ("sa-east-1", "São Paulo"),
+    ("us-gov-east-1", "GovCloud East"),
+    ("us-gov-west-1", "GovCloud West"),
+];
+
 #[derive(Parser)]
 #[command(version, about = "TUI monitor for AWS SSM-managed instances", long_about = None)]
 struct Cli {}
@@ -128,6 +162,7 @@ enum Mode {
     Detail,
     Help,
     ProfilePicker,
+    RegionPicker,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -207,7 +242,7 @@ enum DataUpdate {
 
 enum AppCommand {
     Refresh,
-    SwitchProfile(String),
+    SwitchProfile { profile: String, region: String },
 }
 
 struct App {
@@ -228,6 +263,10 @@ struct App {
     profile: String,
     profiles: Vec<String>,
     profile_picker_idx: usize,
+    profile_picker_text: String,
+    pending_profile: Option<String>,
+    region_picker_idx: usize,
+    region_picker_text: String,
 }
 
 impl App {
@@ -261,6 +300,10 @@ impl App {
             profile,
             profiles,
             profile_picker_idx: 0,
+            profile_picker_text: String::new(),
+            pending_profile: None,
+            region_picker_idx: 0,
+            region_picker_text: String::new(),
         };
         app.reset_selection();
         app
@@ -272,30 +315,126 @@ impl App {
             self.last_error = Some("No profiles found in ~/.aws".into());
             return;
         }
+        self.profile_picker_text.clear();
+        let target = self.profile.clone();
         self.profile_picker_idx = self
-            .profiles
+            .filtered_profiles()
             .iter()
-            .position(|p| p == &self.profile)
+            .position(|p| **p == target)
             .unwrap_or(0);
         self.mode = Mode::ProfilePicker;
     }
 
-    fn picker_next(&mut self) {
-        if self.profiles.is_empty() {
-            return;
+    fn filtered_profiles(&self) -> Vec<&String> {
+        let needle = self.profile_picker_text.to_lowercase();
+        if needle.is_empty() {
+            return self.profiles.iter().collect();
         }
-        self.profile_picker_idx = (self.profile_picker_idx + 1) % self.profiles.len();
+        self.profiles
+            .iter()
+            .filter(|p| p.to_lowercase().contains(&needle))
+            .collect()
     }
 
-    fn picker_previous(&mut self) {
-        if self.profiles.is_empty() {
+    fn profile_picker_next(&mut self) {
+        let len = self.filtered_profiles().len();
+        if len == 0 {
+            return;
+        }
+        self.profile_picker_idx = (self.profile_picker_idx + 1) % len;
+    }
+
+    fn profile_picker_previous(&mut self) {
+        let len = self.filtered_profiles().len();
+        if len == 0 {
             return;
         }
         if self.profile_picker_idx == 0 {
-            self.profile_picker_idx = self.profiles.len() - 1;
+            self.profile_picker_idx = len - 1;
         } else {
             self.profile_picker_idx -= 1;
         }
+    }
+
+    fn profile_picker_filter_changed(&mut self) {
+        // Reset selection on filter change so we land on a valid row.
+        if self.filtered_profiles().is_empty() {
+            self.profile_picker_idx = 0;
+        } else if self.profile_picker_idx >= self.filtered_profiles().len() {
+            self.profile_picker_idx = 0;
+        }
+    }
+
+    fn confirm_profile(&mut self) -> Option<String> {
+        let profile = self
+            .filtered_profiles()
+            .get(self.profile_picker_idx)
+            .map(|s| (*s).clone())?;
+        Some(profile)
+    }
+
+    fn open_region_picker(&mut self, pending_profile: String, default_region: String) {
+        self.pending_profile = Some(pending_profile);
+        self.region_picker_text.clear();
+        let visible = self.filtered_regions();
+        self.region_picker_idx = visible
+            .iter()
+            .position(|(code, _)| *code == default_region.as_str())
+            .unwrap_or(0);
+        self.mode = Mode::RegionPicker;
+    }
+
+    fn filtered_regions(&self) -> Vec<(&'static str, &'static str)> {
+        let needle = self.region_picker_text.to_lowercase();
+        if needle.is_empty() {
+            return AWS_REGIONS.to_vec();
+        }
+        AWS_REGIONS
+            .iter()
+            .copied()
+            .filter(|(code, name)| {
+                code.to_lowercase().contains(&needle) || name.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    fn region_picker_next(&mut self) {
+        let len = self.filtered_regions().len();
+        if len == 0 {
+            return;
+        }
+        self.region_picker_idx = (self.region_picker_idx + 1) % len;
+    }
+
+    fn region_picker_previous(&mut self) {
+        let len = self.filtered_regions().len();
+        if len == 0 {
+            return;
+        }
+        if self.region_picker_idx == 0 {
+            self.region_picker_idx = len - 1;
+        } else {
+            self.region_picker_idx -= 1;
+        }
+    }
+
+    fn region_picker_filter_changed(&mut self) {
+        if self.filtered_regions().is_empty() {
+            self.region_picker_idx = 0;
+        } else if self.region_picker_idx >= self.filtered_regions().len() {
+            self.region_picker_idx = 0;
+        }
+    }
+
+    fn confirm_region(&mut self) -> Option<(String, String)> {
+        let (code, _) = *self.filtered_regions().get(self.region_picker_idx)?;
+        let profile = self.pending_profile.take()?;
+        Some((profile, code.to_string()))
+    }
+
+    fn cancel_region_picker(&mut self) {
+        self.pending_profile = None;
+        self.region_picker_text.clear();
     }
 
     fn status_filter(&self) -> Option<&'static str> {
@@ -520,6 +659,36 @@ fn list_aws_profiles() -> Vec<String> {
     set.into_iter().collect()
 }
 
+fn region_for_profile(profile: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let content = std::fs::read_to_string(format!("{home}/.aws/config")).ok()?;
+    let target = if profile == "default" {
+        "[default]".to_string()
+    } else {
+        format!("[profile {profile}]")
+    };
+    let mut in_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_section = trimmed == target;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("region") {
+            let val = rest
+                .trim_start_matches(|c: char| c == '=' || c.is_whitespace())
+                .trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let w = width.min(area.width);
     let h = height.min(area.height);
@@ -723,20 +892,20 @@ async fn fetch_instances(
     Ok(instances)
 }
 
-async fn build_clients_for_profile(profile: &str) -> (SsmClient, Ec2Client, CwClient, String) {
+async fn build_clients_for_profile(
+    profile: &str,
+    region: &str,
+) -> (SsmClient, Ec2Client, CwClient, String) {
     let config = aws_config::defaults(BehaviorVersion::latest())
         .profile_name(profile)
+        .region(aws_config::Region::new(region.to_string()))
         .load()
         .await;
-    let region = config
-        .region()
-        .map(|r| r.to_string())
-        .unwrap_or_else(|| "unknown".into());
     (
         SsmClient::new(&config),
         Ec2Client::new(&config),
         CwClient::new(&config),
-        region,
+        region.to_string(),
     )
 }
 
@@ -766,7 +935,7 @@ fn spawn_coordinator(
 
             let update = match fetch_instances(&ssm, &ec2, &cw).await {
                 Ok(list) => DataUpdate::Loaded(list),
-                Err(e) => DataUpdate::Failed(e.to_string()),
+                Err(e) => DataUpdate::Failed(format!("{e:#}")),
             };
             if data_tx.send(update).is_err() {
                 break;
@@ -784,14 +953,15 @@ async fn apply_command(
 ) {
     match cmd {
         AppCommand::Refresh => {}
-        AppCommand::SwitchProfile(name) => {
-            let (new_ssm, new_ec2, new_cw, region) = build_clients_for_profile(&name).await;
+        AppCommand::SwitchProfile { profile, region } => {
+            let (new_ssm, new_ec2, new_cw, resolved_region) =
+                build_clients_for_profile(&profile, &region).await;
             *ssm = new_ssm;
             *ec2 = new_ec2;
             *cw = new_cw;
             let _ = data_tx.send(DataUpdate::ProfileSwitched {
-                profile: name,
-                region,
+                profile,
+                region: resolved_region,
             });
         }
     }
@@ -937,6 +1107,11 @@ fn run_app<B: Backend>(
                 KeyCode::Char('b') => app.toggle_favorite(),
                 KeyCode::Char('r') => request_refresh(app, &cmd_tx),
                 KeyCode::Char('p') => app.open_profile_picker(),
+                KeyCode::Char('R') => {
+                    let profile = app.profile.clone();
+                    let region = app.region.clone();
+                    app.open_region_picker(profile, region);
+                }
                 KeyCode::Char('?') => app.mode = Mode::Help,
                 KeyCode::Enter => {
                     if app.selected_id().is_some() {
@@ -985,19 +1160,51 @@ fn run_app<B: Backend>(
                 _ => {}
             },
             Mode::ProfilePicker => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => {
-                    app.mode = Mode::Normal;
-                }
-                KeyCode::Down | KeyCode::Char('j') => app.picker_next(),
-                KeyCode::Up | KeyCode::Char('k') => app.picker_previous(),
+                KeyCode::Esc => app.mode = Mode::Normal,
+                KeyCode::Down => app.profile_picker_next(),
+                KeyCode::Up => app.profile_picker_previous(),
                 KeyCode::Enter => {
-                    if let Some(name) = app.profiles.get(app.profile_picker_idx).cloned() {
-                        if name != app.profile {
-                            app.is_refreshing = true;
-                            let _ = cmd_tx.send(AppCommand::SwitchProfile(name));
+                    if let Some(name) = app.confirm_profile() {
+                        if name == app.profile {
+                            app.mode = Mode::Normal;
+                        } else {
+                            let default_region = region_for_profile(&name)
+                                .unwrap_or_else(|| app.region.clone());
+                            app.open_region_picker(name, default_region);
                         }
                     }
+                }
+                KeyCode::Backspace => {
+                    app.profile_picker_text.pop();
+                    app.profile_picker_filter_changed();
+                }
+                KeyCode::Char(c) => {
+                    app.profile_picker_text.push(c);
+                    app.profile_picker_filter_changed();
+                }
+                _ => {}
+            },
+            Mode::RegionPicker => match key.code {
+                KeyCode::Esc => {
+                    app.cancel_region_picker();
                     app.mode = Mode::Normal;
+                }
+                KeyCode::Down => app.region_picker_next(),
+                KeyCode::Up => app.region_picker_previous(),
+                KeyCode::Enter => {
+                    if let Some((profile, region)) = app.confirm_region() {
+                        app.is_refreshing = true;
+                        let _ = cmd_tx.send(AppCommand::SwitchProfile { profile, region });
+                        app.mode = Mode::Normal;
+                    }
+                }
+                KeyCode::Backspace => {
+                    app.region_picker_text.pop();
+                    app.region_picker_filter_changed();
+                }
+                KeyCode::Char(c) => {
+                    app.region_picker_text.push(c);
+                    app.region_picker_filter_changed();
                 }
                 _ => {}
             },
@@ -1033,18 +1240,47 @@ fn ui(f: &mut Frame, app: &mut App) {
             ui_list(f, app);
             ui_profile_picker(f, app);
         }
+        Mode::RegionPicker => {
+            ui_list(f, app);
+            ui_region_picker(f, app);
+        }
         _ => ui_list(f, app),
     }
 }
 
-fn ui_profile_picker(f: &mut Frame, app: &App) {
-    let height = (app.profiles.len() as u16).saturating_add(4).min(20);
-    let area = centered_rect(50, height, f.area());
+fn picker_lines<I, F>(items: I, selected_idx: usize, render: F) -> Vec<Line<'static>>
+where
+    I: IntoIterator,
+    F: Fn(I::Item, bool) -> Line<'static>,
+{
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| render(item, i == selected_idx))
+        .collect()
+}
 
-    let mut lines: Vec<Line> = Vec::with_capacity(app.profiles.len());
-    for (i, name) in app.profiles.iter().enumerate() {
-        let is_current = name == &app.profile;
-        let is_selected = i == app.profile_picker_idx;
+fn picker_search_line(text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" 🔍 ", Style::default().fg(Color::DarkGray)),
+        Span::raw(text.to_string()),
+        Span::styled("_", Style::default().fg(Color::Yellow)),
+    ])
+}
+
+fn ui_profile_picker(f: &mut Frame, app: &App) {
+    let visible = app.filtered_profiles();
+    let total = app.profiles.len();
+    let body_height = (visible.len() as u16).max(1).min(12);
+    let height = body_height + 5;
+    let area = centered_rect(56, height, f.area());
+
+    let current_profile = app.profile.clone();
+    let selected_idx = app.profile_picker_idx;
+    let owned: Vec<String> = visible.iter().map(|s| (*s).clone()).collect();
+
+    let item_lines = picker_lines(owned, selected_idx, move |name, is_selected| {
+        let is_current = name == current_profile;
         let marker = if is_current { " ● " } else { "   " };
         let style = if is_selected {
             Style::default()
@@ -1056,10 +1292,80 @@ fn ui_profile_picker(f: &mut Frame, app: &App) {
         } else {
             Style::default()
         };
-        lines.push(Line::from(Span::styled(format!("{marker}{name}"), style)));
+        Line::from(Span::styled(format!("{marker}{name}"), style))
+    });
+
+    let mut lines = vec![picker_search_line(&app.profile_picker_text), Line::from("")];
+    if item_lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (no match)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.extend(item_lines);
     }
 
-    let title = " Switch profile — ↑/↓ · Enter to confirm · Esc to cancel ";
+    let title = format!(
+        " Switch profile ({}/{}) — type to filter · ↑/↓ · Enter · Esc ",
+        visible.len(),
+        total
+    );
+    let widget = Paragraph::new(Text::from(lines)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .style(Style::default().bg(Color::Black)),
+    );
+    f.render_widget(Clear, area);
+    f.render_widget(widget, area);
+}
+
+fn ui_region_picker(f: &mut Frame, app: &App) {
+    let visible = app.filtered_regions();
+    let body_height = (visible.len() as u16).max(1).min(14);
+    let height = body_height + 5;
+    let area = centered_rect(60, height, f.area());
+
+    let default_region = app.region.clone();
+    let selected_idx = app.region_picker_idx;
+    let owned: Vec<(String, String)> = visible
+        .iter()
+        .map(|(c, n)| (c.to_string(), n.to_string()))
+        .collect();
+
+    let item_lines = picker_lines(owned, selected_idx, move |(code, name), is_selected| {
+        let is_current = code == default_region;
+        let marker = if is_current { " ● " } else { "   " };
+        let style = if is_selected {
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        };
+        Line::from(Span::styled(
+            format!("{marker}{code:<18} {name}"),
+            style,
+        ))
+    });
+
+    let mut lines = vec![picker_search_line(&app.region_picker_text), Line::from("")];
+    if item_lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (no match)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.extend(item_lines);
+    }
+
+    let pending = app.pending_profile.as_deref().unwrap_or("");
+    let title = format!(
+        " Region for profile '{pending}' — type to filter · ↑/↓ · Enter · Esc ",
+    );
     let widget = Paragraph::new(Text::from(lines)).block(
         Block::default()
             .borders(Borders::ALL)
@@ -1389,7 +1695,8 @@ fn ui_help(f: &mut Frame) {
         help_section("Actions"),
         help_line("b", "bookmark / toggle favorite on selected instance (persisted)"),
         help_line("r", "refresh data immediately (auto every 30s)"),
-        help_line("p", "switch AWS profile (lists ~/.aws/config and ~/.aws/credentials)"),
+        help_line("p", "switch AWS profile (then region) — both pickers are filterable"),
+        help_line("R", "switch region only (keep current profile)"),
         help_line("c", "(in detail view) start an SSM session on the selected instance"),
         Line::from(""),
         help_section("Notes"),
